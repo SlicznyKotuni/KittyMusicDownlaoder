@@ -4,7 +4,9 @@ Python 3.10+
 Wymagania: customtkinter, pandas, yt-dlp.exe w tym samym folderze
 """
 
+import atexit
 import re
+import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +20,29 @@ import customtkinter as ctk
 import pandas as pd
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Globalny rejestr aktywnych procesów yt-dlp
+# ──────────────────────────────────────────────────────────────────────────────
+
+_active_procs: set[subprocess.Popen] = set()
+_procs_lock = threading.Lock()
+
+
+def _kill_all_ytdlp() -> None:
+    """Natychmiast ubija wszystkie aktywne procesy yt-dlp."""
+    with _procs_lock:
+        procs = list(_active_procs)
+    for proc in procs:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    with _procs_lock:
+        _active_procs.clear()
+
+
+atexit.register(_kill_all_ytdlp)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Konfiguracja
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -25,6 +50,7 @@ APP_TITLE    = "Shazam Downloader – automatyczne pobieranie z My Shazam"
 APP_SIZE     = "1440x780"
 APP_MIN_SIZE = (1300, 700)
 MAX_WORKERS  = 4
+MAX_WORKERS_CHECK = 12
 
 BASE_DIR           = Path(sys.argv[0]).parent.resolve()
 YTDLP_PATH         = BASE_DIR / "yt-dlp.exe"
@@ -112,24 +138,39 @@ def check_youtube_availability(
     """
     Wyszukuje utwór na YouTube próbując kolejnych strategii.
     Zwraca dict {url, yt_title, duration} lub None.
+    Rejestruje proces w _active_procs – ubijany przy awarii.
     """
-    import subprocess
     for strategy in SEARCH_STRATEGIES:
         query = strategy.format(artist=artist, title=title)
         cmd = [str(ytdlp_path), "--flat-playlist",
                "--print", "%(title)s|%(url)s|%(duration)s",
                "--no-warnings", f"ytsearch1:{query}"]
+        proc = None
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=timeout, encoding="utf-8", errors="replace")
-            output = proc.stdout.strip()
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            with _procs_lock:
+                _active_procs.add(proc)
+            stdout, _ = proc.communicate(timeout=timeout)
+            output = stdout.strip()
             if output:
                 parts = output.split("|")
                 if len(parts) >= 2:
                     return {"yt_title": parts[0], "url": parts[1],
                             "duration": parts[2] if len(parts) > 2 else "?"}
         except Exception:
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             continue
+        finally:
+            if proc is not None:
+                with _procs_lock:
+                    _active_procs.discard(proc)
     return None
 
 
@@ -141,8 +182,8 @@ def download_track(
     Pobiera utwór jako MP3 lub MP4.
     Zwraca (sukces: bool, komunikat_błędu: str).
     Przy sukcesie komunikat jest pusty.
+    Rejestruje proces w _active_procs – ubijany przy awarii.
     """
-    import subprocess
     safe_name    = sanitize_filename(f"{artist} - {title}")
     out_template = str(output_dir / f"{safe_name}.%(ext)s")
 
@@ -154,20 +195,33 @@ def download_track(
                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
                "--merge-output-format", "mp4",
                "-o", out_template, "--no-warnings", url]
+    proc = None
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, encoding="utf-8", errors="replace")
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        with _procs_lock:
+            _active_procs.add(proc)
+        _, stderr = proc.communicate(timeout=timeout)
         if proc.returncode == 0:
             return True, ""
-        # Wyciągamy czytelną przyczynę z stderr
-        stderr = proc.stderr or ""
         error_lines = [l.strip() for l in stderr.splitlines() if "ERROR" in l.upper()]
         reason = error_lines[0][:120] if error_lines else (stderr.strip()[:120] or "Nieznany błąd yt-dlp")
         return False, reason
     except subprocess.TimeoutExpired:
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         return False, f"Timeout ({timeout}s) – zbyt wolne połączenie"
     except Exception as e:
         return False, str(e)[:120]
+    finally:
+        if proc is not None:
+            with _procs_lock:
+                _active_procs.discard(proc)
 
 
 def save_error_report(failed: list[dict], output_dir: Path) -> Path:
@@ -192,13 +246,26 @@ def save_error_report(failed: list[dict], output_dir: Path) -> Path:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TrackListPanel(ctk.CTkFrame):
-    """Reużywalny panel z nagłówkiem i scrollowalną listą. Opcjonalna kolumna błędu."""
+    """
+    Reużywalny panel z nagłówkiem i scrollowalną listą. Opcjonalna kolumna błędu.
+
+    Używa wirtualnego renderowania: niezależnie od liczby utworów w pamięci,
+    w widgecie istnieje maksymalnie _VISIBLE_ROWS wierszy. Dzięki temu panel
+    obsługuje listy 1500+ elementów bez spowolnienia GUI.
+    """
+
+    _VISIBLE_ROWS = 50   # liczba jednocześnie renderowanych wierszy
 
     def __init__(self, master, title: str, header_color: str = "#1a1a2e",
                  show_error_col: bool = False, **kwargs):
         super().__init__(master, **kwargs)
         self._show_error = show_error_col
-        self._rows: list[ctk.CTkFrame] = []
+        # Pełne dane (mogą mieć 1500+ elementów)
+        self._data: list[dict] = []
+        self._colors: tuple[str, str] = COLORS_BLUE
+        # Pula widgetów wierszy (stała liczba)
+        self._row_widgets: list[ctk.CTkFrame] = []
+        self._row_labels:  list[list[ctk.CTkLabel]] = []
         self._build(title, header_color)
 
     def _build(self, title: str, header_color: str):
@@ -214,7 +281,7 @@ class TrackListPanel(ctk.CTkFrame):
         cols_frame.pack_propagate(False)
         headers = [("Lp.", 34), ("Wykonawca", 115), ("Tytuł", 115)]
         if self._show_error:
-            headers.append(("Przyczyna błędu", 0))  # 0 = rozciągnij resztę
+            headers.append(("Przyczyna błędu", 0))
         for i, (text, w) in enumerate(headers):
             lbl = ctk.CTkLabel(
                 cols_frame, text=text, width=w if w else 1,
@@ -231,47 +298,111 @@ class TrackListPanel(ctk.CTkFrame):
         )
         self.scroll_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
+        # Tworzymy pulę wierszy raz – reużywana przy każdej zmianie danych
+        self._build_row_pool()
+
+    def _build_row_pool(self):
+        """Tworzy _VISIBLE_ROWS wierszy z etykietami. Wywoływane tylko raz."""
+        n_cols = 4 if self._show_error else 3
+        col_widths = [34, 115, 115]  # Lp., Wykonawca, Tytuł
+        col_anchors = ["e", "w", "w"]
+        if self._show_error:
+            col_widths.append(0)
+            col_anchors.append("w")
+
+        for _ in range(self._VISIBLE_ROWS):
+            row = ctk.CTkFrame(
+                self.scroll_frame, fg_color="#0d0d1a", corner_radius=3, height=24
+            )
+            row.pack(fill="x", padx=2, pady=1)
+            row.pack_propagate(False)
+
+            labels = []
+            for j in range(n_cols):
+                w = col_widths[j]
+                expand = (w == 0)
+                lbl = ctk.CTkLabel(
+                    row, text="",
+                    width=w if w else 1,
+                    font=ctk.CTkFont(family="Segoe UI", size=9),
+                    text_color="#d0d0e8",
+                    anchor=col_anchors[j],
+                )
+                lbl.pack(
+                    side="left", padx=(4 if j == 0 else 6, 0) if (self._show_error and j == n_cols - 1) else (4, 0),
+                    fill="x" if expand else None,
+                    expand=expand,
+                )
+                labels.append(lbl)
+
+            self._row_widgets.append(row)
+            self._row_labels.append(labels)
+
+        # Etykieta "i więcej…" gdy danych jest za dużo
+        self._lbl_overflow = ctk.CTkLabel(
+            self.scroll_frame, text="",
+            font=ctk.CTkFont(family="Segoe UI", size=9, weight="bold"),
+            text_color="#8888aa", anchor="w",
+        )
+        self._lbl_overflow.pack(fill="x", padx=8, pady=2)
+
+    def _refresh_rows(self):
+        """Aktualizuje tekst/kolor widgetów wierszy na podstawie self._data."""
+        total = len(self._data)
+        visible = min(total, self._VISIBLE_ROWS)
+
+        for i, (row, labels) in enumerate(zip(self._row_widgets, self._row_labels)):
+            if i < visible:
+                t = self._data[i]
+                color = self._colors[i % 2]
+                row.configure(fg_color=color)
+                row.pack()  # upewniamy się że jest widoczny
+
+                artist = t["artist"]
+                title  = t["title"]
+                labels[0].configure(text=str(i + 1), text_color="#d0d0e8")
+                labels[1].configure(
+                    text=artist[:22] if len(artist) > 22 else artist,
+                    text_color="#d0d0e8",
+                )
+                labels[2].configure(
+                    text=title[:26] if len(title) > 26 else title,
+                    text_color="#d0d0e8",
+                )
+                if self._show_error and len(labels) > 3:
+                    err = t.get("error", "")
+                    short_err = err[:70] if len(err) > 70 else err
+                    labels[3].configure(text=short_err, text_color="#ffaa66")
+            else:
+                row.pack_forget()  # ukrywamy nadmiarowe wiersze
+
+        # Komunikat o ukrytych wierszach
+        hidden = total - visible
+        if hidden > 0:
+            self._lbl_overflow.configure(
+                text=f"… i jeszcze {hidden} utworów (łącznie: {total})"
+            )
+        else:
+            self._lbl_overflow.configure(text="")
+
     def clear(self):
-        for row in self._rows:
-            row.destroy()
-        self._rows.clear()
+        self._data.clear()
+        self._refresh_rows()
 
     def add_track(self, lp: int, artist: str, title: str,
                   color: str = "#1a1a2e", error: str = ""):
-        row = ctk.CTkFrame(self.scroll_frame, fg_color=color, corner_radius=3, height=24)
-        row.pack(fill="x", padx=2, pady=1)
-        row.pack_propagate(False)
-
-        entries = [
-            (str(lp),                                          34,  "e"),
-            (artist[:22] if len(artist) > 22 else artist,     115, "w"),
-            (title[:26]  if len(title)  > 26 else title,      115, "w"),
-        ]
-        for text, w, anchor in entries:
-            ctk.CTkLabel(row, text=text, width=w,
-                         font=ctk.CTkFont(family="Segoe UI", size=9),
-                         text_color="#d0d0e8", anchor=anchor,
-                         ).pack(side="left", padx=(4, 0))
-
-        if self._show_error and error:
-            # Błąd wypełnia resztę wiersza
-            short_err = error[:70] if len(error) > 70 else error
-            ctk.CTkLabel(row, text=short_err,
-                         font=ctk.CTkFont(family="Segoe UI", size=9),
-                         text_color="#ffaa66", anchor="w",
-                         ).pack(side="left", padx=(6, 4), fill="x", expand=True)
-
-        self._rows.append(row)
+        """Dodaje jeden wiersz do danych i odświeża widok."""
+        self._data.append({"artist": artist, "title": title, "error": error})
+        self._refresh_rows()
 
     def get_count(self) -> int:
-        return len(self._rows)
+        return len(self._data)
 
     def populate(self, tracks: list[dict], colors: tuple[str, str] = COLORS_BLUE):
         """Wypełnia panel listą. Każdy dict: artist, title; opcjonalnie error."""
-        self.clear()
-        for i, t in enumerate(tracks):
-            self.add_track(i + 1, t["artist"], t["title"],
-                           color=colors[i % 2], error=t.get("error", ""))
+        self._colors = colors
+        self._data = list(tracks)
+        self._refresh_rows()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -426,6 +557,12 @@ class App(ctk.CTk):
 
         self._check_ytdlp()
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        """Zamknięcie okna: ubij wszystkie yt-dlp, dopiero potem wyjdź."""
+        _kill_all_ytdlp()
+        self.destroy()
 
     def _check_ytdlp(self):
         if not YTDLP_PATH.exists():
@@ -657,7 +794,7 @@ class App(ctk.CTk):
         self.panel_found.clear()
         self.panel_missing.clear()
         self.panel_failed.clear()
-        self.btn_check.configure(state="disabled", text="⏳ Sprawdzam…")
+        self.btn_check.configure(state="disabled", text=f"⏳ Sprawdzam… ({MAX_WORKERS_CHECK} wątków)")
         self.btn_retry.configure(state="disabled")
         self.btn_report.configure(state="disabled")
         self._set_dl_buttons(False)
@@ -666,25 +803,55 @@ class App(ctk.CTk):
         threading.Thread(target=self._run_youtube_check, daemon=True).start()
 
     def _run_youtube_check(self):
-        """Wątek: sprawdza każdy utwór na YouTube i aktualizuje listy."""
-        total = len(self._all_tracks)
-        for i, track in enumerate(self._all_tracks, 1):
+        """Wątek: wielowątkowe sprawdzanie YouTube (znacznie szybsze przy 1000+ utworach)."""
+        import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        tracks = list(self._all_tracks)
+        total = len(tracks)
+        done = 0
+        found_count = 0
+
+        def _check_single(track: dict) -> dict:
+            """Pomocnicza funkcja dla ThreadPoolExecutor."""
             result = check_youtube_availability(track["artist"], track["title"], YTDLP_PATH)
             if result:
-                self._found_tracks.append({**track, **result})
+                return {**track, **result}
             else:
-                self._not_found_tracks.append(track)
-            self.after(0, self._update_check_ui, i, total)
+                return {**track, "not_found": True}
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_CHECK) as executor:
+            future_to_track = {executor.submit(_check_single, t): t for t in tracks}
+
+            for future in as_completed(future_to_track):
+                result_track = future.result()
+
+                if "not_found" in result_track:
+                    self._not_found_tracks.append(result_track)
+                else:
+                    self._found_tracks.append(result_track)
+                    found_count += 1
+
+                done += 1
+
+                # Aktualizacja UI co ~50 ukończonych utworów (żeby nie spamować GUI przy dużych listach)
+                if done % 50 == 0 or done == total:
+                    self.after(0, self._update_check_ui, done, total, found_count)
+
+                # Mały delay żeby nie zalać YouTube
+                time.sleep(0.15)
+
         self.after(0, self._finish_youtube_check)
 
-    def _update_check_ui(self, done: int, total: int):
-        """Aktualizuje UI podczas sprawdzania (wywołanie z głównego wątku)."""
+    def _update_check_ui(self, done: int, total: int, found: int):
+        """Aktualizacja paska postępu i list podczas sprawdzania."""
         self.lbl_progress.configure(
             text=f"Sprawdzanie: {done}/{total}  |  "
-                 f"✅ Znaleziono: {len(self._found_tracks)}  "
-                 f"❌ Nie znaleziono: {len(self._not_found_tracks)}"
+                 f"✅ Znaleziono: {found}  ❌ Nie znaleziono: {len(self._not_found_tracks)}"
         )
         self.progress_bar.set(done / total)
+
+        # Odświeżamy listy tylko co kilka aktualizacji (szybkość + stabilność)
         self.panel_found.populate(self._found_tracks, COLORS_GREEN)
         self.panel_missing.populate(self._not_found_tracks, COLORS_RED)
 
